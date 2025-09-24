@@ -29,6 +29,7 @@ use clap::{
 };
 use inferno::{collapse::Collapse, flamegraph::color::Palette, flamegraph::from_reader};
 use rustc_demangle::demangle_stream;
+use std::sync::OnceLock;
 
 pub enum Workload {
     Command(Vec<String>),
@@ -1151,10 +1152,173 @@ fn stem_spanning_entire_window(bytes: &[u8]) -> Option<(String, u64)> {
 
 /// Stub for future sound generation. Currently does nothing.
 /// `function` is the leaf frame symbol, `count` is the sample count for that leaf in this line.
-fn on_function_activity(func: &str, _count: u64) {
-    // Hook for future sound generation.
-    // Intentionally no stdout printing to keep real-time output quiet.
-    println!("name: {}", func);
+fn on_function_activity(func: &str, count: u64) {
+    // Send a short tone for this function name into the audio thread.
+    if let Some(tx) = AUDIO_TX.get_or_init(init_audio_thread).as_ref() {
+        let freq = freq_for_function(func);
+        let frames_hint = 12; // ~12ms at 1kHz sample equivalent scaling computed in thread
+        let _ = tx.try_send(ToneCmd {
+            freq_hz: freq,
+            frames_hint,
+            gain: 0.08,
+            count: count.min(10) as u32,
+        });
+    }
+}
+
+// Background audio thread plumbing
+#[derive(Clone, Copy)]
+struct ToneCmd {
+    freq_hz: f32,
+    frames_hint: usize,
+    gain: f32,
+    count: u32,
+}
+
+static AUDIO_TX: OnceLock<Option<crossbeam_channel::Sender<ToneCmd>>> = OnceLock::new();
+
+fn init_audio_thread() -> Option<crossbeam_channel::Sender<ToneCmd>> {
+    let (tx, rx) = crossbeam_channel::unbounded::<ToneCmd>();
+    let _ = std::thread::Builder::new()
+        .name("rattletrap-audio".into())
+        .spawn(move || {
+            // Initialize audio inside the thread; if anything fails, just exit.
+            let host = cpal::default_host();
+            let Some(device) = host.default_output_device() else {
+                return;
+            };
+            let Ok(config) = device.default_output_config() else {
+                return;
+            };
+            let sample_rate = config.sample_rate().0 as usize;
+            let channels = config.channels() as usize;
+
+            // ~1s buffer
+            let rb = ringbuf::HeapRb::<f32>::new(sample_rate * channels);
+            use ringbuf::traits::{Consumer as _, Producer as _, Split as _};
+            let (mut prod, mut cons) = rb.split();
+
+            use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+            let stream = match config.sample_format() {
+                cpal::SampleFormat::F32 => device
+                    .build_output_stream(
+                        &cpal::StreamConfig::from(config.clone()),
+                        move |out: &mut [f32], _| {
+                            let n = cons.pop_slice(out);
+                            out[n..].fill(0.0);
+                        },
+                        |err| eprintln!("audio stream error: {err}"),
+                        None,
+                    )
+                    .ok(),
+                cpal::SampleFormat::I16 => device
+                    .build_output_stream(
+                        &cpal::StreamConfig::from(config.clone()),
+                        move |out: &mut [i16], _| {
+                            let mut tmp = vec![0.0f32; out.len()];
+                            let n = cons.pop_slice(&mut tmp);
+                            for (d, s) in out.iter_mut().zip(tmp.iter()) {
+                                let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
+                                *d = v;
+                            }
+                            if n < tmp.len() {
+                                // zeros already default from tmp
+                            }
+                        },
+                        |err| eprintln!("audio stream error: {err}"),
+                        None,
+                    )
+                    .ok(),
+                cpal::SampleFormat::U16 => device
+                    .build_output_stream(
+                        &cpal::StreamConfig::from(config.clone()),
+                        move |out: &mut [u16], _| {
+                            let mut tmp = vec![0.0f32; out.len()];
+                            let n = cons.pop_slice(&mut tmp);
+                            for (d, s) in out.iter_mut().zip(tmp.iter()) {
+                                let v = (((s.clamp(-1.0, 1.0) + 1.0) * 0.5) * u16::MAX as f32)
+                                    .round() as u16;
+                                *d = v;
+                            }
+                            if n < tmp.len() {
+                                // zeros already default from tmp
+                            }
+                        },
+                        |err| eprintln!("audio stream error: {err}"),
+                        None,
+                    )
+                    .ok(),
+                _ => None,
+            };
+            let Some(stream) = stream else {
+                return;
+            };
+            if stream.play().is_err() {
+                return;
+            }
+
+            // Synthesis loop: receive tone commands and append to ring buffer
+            let fs = sample_rate as f32;
+            loop {
+                match rx.recv() {
+                    Ok(cmd) => {
+                        let base_frames = ((fs) * 0.012).round() as usize; // ~12ms
+                        let extra = (cmd.count as usize) * (sample_rate / 2000);
+                        let frames = base_frames.max(cmd.frames_hint) + extra;
+                        let phase_inc = 2.0 * std::f32::consts::PI * cmd.freq_hz / fs;
+                        let mut phase = 0.0f32;
+                        let mut buf = vec![0.0f32; frames * channels];
+                        let mut idx = 0;
+                        for _ in 0..frames {
+                            let s = phase.sin() * cmd.gain;
+                            phase += phase_inc;
+                            if phase > 2.0 * std::f32::consts::PI {
+                                phase -= 2.0 * std::f32::consts::PI;
+                            }
+                            for _c in 0..channels {
+                                buf[idx] = s;
+                                idx += 1;
+                            }
+                        }
+                        let _ = prod.push_slice(&buf);
+                        // Coalesce any immediate backlog without blocking
+                        for cmd in rx.try_iter().take(8) {
+                            let phase_inc = 2.0 * std::f32::consts::PI * cmd.freq_hz / fs;
+                            let mut phase = 0.0f32;
+                            let frames = base_frames + (cmd.count as usize) * (sample_rate / 2000);
+                            let mut buf = vec![0.0f32; frames * channels];
+                            let mut idx = 0;
+                            for _ in 0..frames {
+                                let s = phase.sin() * cmd.gain;
+                                phase += phase_inc;
+                                if phase > 2.0 * std::f32::consts::PI {
+                                    phase -= 2.0 * std::f32::consts::PI;
+                                }
+                                for _c in 0..channels {
+                                    buf[idx] = s;
+                                    idx += 1;
+                                }
+                            }
+                            let _ = prod.push_slice(&buf);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    Some(tx)
+}
+
+fn freq_for_function(name: &str) -> f32 {
+    // Map function name to a musical pitch deterministically.
+    // Use a simple DJB2 hash and map to MIDI 48..84 (C3..C6).
+    let mut h: u32 = 5381;
+    for b in name.as_bytes() {
+        h = ((h << 5).wrapping_add(h)).wrapping_add(*b as u32);
+    }
+    let midi = 48u32 + (h % 37); // 48..84 inclusive (37 steps)
+    let semis_from_a4 = midi as i32 - 69; // A4=69
+    440.0_f32 * 2.0_f32.powf(semis_from_a4 as f32 / 12.0)
 }
 
 #[derive(Debug, Args)]
