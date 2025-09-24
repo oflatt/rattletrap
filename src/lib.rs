@@ -896,9 +896,9 @@ fn macos_stream_and_collapse(
         freq
     );
     cmd.arg("-n").arg(profile_clause);
-    // Add a sentinel after each 100ms aggregate to delimit windows for incremental collapse.
+    // Add a sentinel after each 25ms aggregate to delimit windows for incremental collapse.
     cmd.arg("-n")
-        .arg("tick-100ms { printa(@); printf(\"__RT_END__\\n\"); trunc(@); }");
+        .arg("tick-25ms { printa(@); printf(\"__RT_END__\\n\"); trunc(@); }");
 
     match workload {
         Workload::Command(args) => {
@@ -998,9 +998,12 @@ fn macos_stream_and_collapse(
                 continue;
             }
 
-            // Demangle folded lines and emit events immediately
+            // Demangle folded lines, pick the hottest leaf in this window,
+            // and emit a single real-time activity event.
             let demangled = demangle_folded(&folded);
-            sonify_collapsed_stacks(&demangled);
+            if let Some((leaf, count)) = hottest_leaf_in_folded_window(&demangled) {
+                on_function_activity(&leaf, count);
+            }
             // Accumulate for final SVG
             collapsed_sink.extend_from_slice(&demangled);
         }
@@ -1063,20 +1066,43 @@ fn sonify_collapsed_stacks(collapsed: &[u8]) {
     }
 }
 
+/// From a chunk of folded lines (one window), select the hottest leaf function and its count.
+/// Returns None if no valid folded lines are present.
+fn hottest_leaf_in_folded_window(bytes: &[u8]) -> Option<(String, u64)> {
+    let mut best_fn: Option<String> = None;
+    let mut best_count: u64 = 0;
+    for line in bytes.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        // Expect: f1;f2;...;leaf COUNT
+        let s = match std::str::from_utf8(line) {
+            Ok(s) => s.trim_end(),
+            Err(_) => continue,
+        };
+        let (stack, count_str) = match s.rsplit_once(' ') {
+            Some(t) => t,
+            None => continue,
+        };
+        let count: u64 = count_str.parse().unwrap_or(1);
+        let leaf = match stack.rsplit_once(';') {
+            Some((_, leaf)) => leaf,
+            None => stack,
+        };
+        if count > best_count {
+            best_count = count;
+            best_fn = Some(leaf.to_string());
+        }
+    }
+    best_fn.map(|f| (f, best_count))
+}
+
 /// Stub for future sound generation. Currently does nothing.
 /// `function` is the leaf frame symbol, `count` is the sample count for that leaf in this line.
-fn on_function_activity(function: &str, _count: u64) {
+fn on_function_activity(func: &str, _count: u64) {
     // Hook for future sound generation.
-    // Intentionally no stdout printing by default to keep real-time output quiet.
-    // Enable debug printing by setting env var RATTLETRAP_SONIFY_DEBUG=1.
-    static SONIFY_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *SONIFY_DEBUG.get_or_init(|| match std::env::var("RATTLETRAP_SONIFY_DEBUG") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => false,
-    });
-    if enabled {
-        println!("{}", function);
-    }
+    // Intentionally no stdout printing to keep real-time output quiet.
+    println!("name: {}", func);
 }
 
 #[derive(Debug, Args)]
@@ -1135,7 +1161,9 @@ impl Options {
     }
 
     pub fn frequency(&self) -> u32 {
-        self.frequency.unwrap_or(997)
+        // Use a higher default sampling frequency for more responsiveness.
+        // Users can still override via -F/--freq.
+        self.frequency.unwrap_or(1997)
     }
 }
 
