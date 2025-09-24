@@ -635,10 +635,6 @@ pub fn generate_flamegraph_for_workload(workload: Workload, opts: Options) -> an
         collapsed = thread_handle.join().unwrap()?;
     }
 
-    // Always-on, minimal sonification hook: parse collapsed stacks and invoke a no-op callback.
-    // This is intentionally lightweight and side-effect-free for now; we'll wire real sound later.
-    sonify_collapsed_stacks(&collapsed);
-
     let collapsed_reader = BufReader::new(&*collapsed);
 
     let flamegraph_filename = opts.output;
@@ -1001,11 +997,12 @@ fn macos_stream_and_collapse(
                 continue;
             }
 
-            // Demangle folded lines, pick the hottest leaf in this window,
+            // Demangle folded lines, pick the deepest function present in all samples
+            // in this window (the "stem" the program spent the whole time in),
             // and emit a single real-time activity event.
             let demangled = demangle_folded(&folded);
-            if let Some((leaf, count)) = hottest_leaf_in_folded_window(&demangled) {
-                on_function_activity(&leaf, count);
+            if let Some((stem, count)) = stem_spanning_entire_window(&demangled) {
+                on_function_activity(&stem, count);
             }
             // Accumulate for final SVG
             collapsed_sink.extend_from_slice(&demangled);
@@ -1098,6 +1095,58 @@ fn hottest_leaf_in_folded_window(bytes: &[u8]) -> Option<(String, u64)> {
         }
     }
     best_fn.map(|f| (f, best_count))
+}
+
+/// From a chunk of folded lines (one window), compute the deepest frame that appears in all
+/// stacks (longest common prefix by frames) and return that frame with the total sample count
+/// across the window. If no common frame exists, returns None.
+fn stem_spanning_entire_window(bytes: &[u8]) -> Option<(String, u64)> {
+    let mut common_prefix: Vec<String> = Vec::new();
+    let mut total_count: u64 = 0;
+    let mut initialized = false;
+
+    for line in bytes.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let s = match std::str::from_utf8(line) {
+            Ok(s) => s.trim_end(),
+            Err(_) => continue,
+        };
+        let (stack_str, count_str) = match s.rsplit_once(' ') {
+            Some(t) => t,
+            None => continue,
+        };
+        let count: u64 = count_str.parse().unwrap_or(1);
+        total_count = total_count.saturating_add(count);
+
+        // Split stack into frames from root to leaf
+        let frames: Vec<&str> = stack_str.split(';').collect();
+        if !initialized {
+            common_prefix = frames.iter().map(|f| f.to_string()).collect();
+            initialized = true;
+        } else {
+            let max = common_prefix.len().min(frames.len());
+            let mut new_len = 0;
+            while new_len < max && common_prefix[new_len] == frames[new_len] {
+                new_len += 1;
+            }
+            common_prefix.truncate(new_len);
+            if common_prefix.is_empty() {
+                // Early out: no shared frame across all samples
+                // We can still return None; but continue to sum counts for consistency
+                // and break to save work.
+                // break; // keep scanning to consume input; not strictly necessary
+            }
+        }
+    }
+
+    if initialized && !common_prefix.is_empty() {
+        let stem = common_prefix.pop().unwrap();
+        Some((stem, total_count))
+    } else {
+        None
+    }
 }
 
 /// Stub for future sound generation. Currently does nothing.
