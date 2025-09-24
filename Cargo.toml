@@ -1,21 +1,21 @@
 [package]
-name = "flamegraph"
+name = "rattletrap"
 version = "0.6.9"
 edition = "2021"
 rust-version = "1.78"
-description = "A simple cargo subcommand for generating flamegraphs, using inferno under the hood"
+description = "A simple cargo subcommand for running rattletrap"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/flamegraph-rs/flamegraph"
+repository = "https://github.com/oflatt/rattletrap"
 keywords = ["perf", "flamegraph", "profiling", "cargo", "cargo-subcommand"]
 categories = ["command-line-utilities", "development-tools::profiling", "visualization", "development-tools::cargo-plugins"]
 readme = "README.md"
 
 [[bin]]
-name = "cargo-flamegraph"
+name = "cargo-rattletrap"
 path = "src/bin/cargo-flamegraph.rs"
 
 [[bin]]
-name = "flamegraph"
+name = "rattletrap"
 path = "src/bin/flamegraph.rs"
 
 [dependencies]

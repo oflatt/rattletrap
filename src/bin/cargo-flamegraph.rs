@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context};
 use cargo_metadata::{Artifact, ArtifactDebuginfo, Message, MetadataCommand, Package, TargetKind};
 use clap::{Args, Parser};
 
-use flamegraph::Workload;
+use rattletrap::Workload;
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 #[clap(rename_all = "snake_case")]
@@ -81,7 +81,7 @@ struct Opt {
     release: bool,
 
     #[clap(flatten)]
-    graph: flamegraph::Options,
+    graph: rattletrap::Options,
 
     /// Trailing arguments passed to the binary being profiled.
     #[clap(last = true)]
@@ -236,7 +236,7 @@ fn workload(opt: &Opt, artifacts: &[Artifact]) -> anyhow::Result<Vec<String>> {
             a.executable
                 .as_deref()
                 .filter(|_| {
-                    a.target.name == *target && a.target.kind.iter().any(|k| kind.contains(&k))
+                    a.target.name == *target && a.target.kind.iter().any(|k| kind.contains(k))
                 })
                 .map(|e| (&a.profile.debuginfo, e))
         })
@@ -379,7 +379,7 @@ fn find_unique_target(
             }
             targets.into_iter().filter_map(move |t| {
                 // Keep only targets that are of the right kind.
-                if !t.kind.iter().any(|s| kind.contains(&s)) {
+                if !t.kind.iter().any(|s| kind.contains(s)) {
                     return None;
                 }
 
@@ -478,5 +478,5 @@ fn main() -> anyhow::Result<()> {
 
     let artifacts = build(&opt, kind)?;
     let workload = workload(&opt, &artifacts)?;
-    flamegraph::generate_flamegraph_for_workload(Workload::Command(workload), opt.graph)
+    rattletrap::generate_flamegraph_for_workload(Workload::Command(workload), opt.graph)
 }

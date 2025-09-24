@@ -521,23 +521,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4443176a9f2c162692bd3d352d745ef9413eec5782a80d8fd6f8a1ac692a07f7"
 
 [[package]]
-name = "flamegraph"
-version = "0.6.9"
-dependencies = [
- "anyhow",
- "blondie",
- "cargo_metadata",
- "clap",
- "clap_complete",
- "indicatif",
- "inferno",
- "opener",
- "rustc-demangle",
- "shlex",
- "signal-hook",
-]
-
-[[package]]
 name = "flate2"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1232,6 +1215,23 @@ dependencies = [
  "binary-merge",
  "inplace-vec-builder",
  "smallvec",
+]
+
+[[package]]
+name = "rattletrap"
+version = "0.6.9"
+dependencies = [
+ "anyhow",
+ "blondie",
+ "cargo_metadata",
+ "clap",
+ "clap_complete",
+ "indicatif",
+ "inferno",
+ "opener",
+ "rustc-demangle",
+ "shlex",
+ "signal-hook",
 ]
 
 [[package]]

@@ -1,12 +1,8 @@
-# [cargo-]flamegraph
+# [cargo-]rattletrap
 
-[![colorized flamegraph output](example_cropped.png)](example.svg)
+Hear your code running! Rattletrap instruments your code so that you can hear its profiling data real time. Inspired by flamegraphs, this library uses stack information and other dynamic sources to sonify your code's execution.
 
-A Rust-powered flamegraph generator with additional support for
-Cargo projects! It can be used to profile anything,
-not just Rust projects! No perl or pipes required <3
-
-Built on top of [@jonhoo's](https://github.com/jonhoo) wonderful [Inferno](https://github.com/jonhoo/inferno) all-rust flamegraph generation library!
+Built on top of [flamegraph](https://github.com/flamegraph).
 
 > [!TIP]
 > You might want to also try [samply](https://github.com/mstange/samply), which provides a more interactive UI

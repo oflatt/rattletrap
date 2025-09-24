@@ -4,7 +4,7 @@ use anyhow::anyhow;
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 
-use flamegraph::Workload;
+use rattletrap::Workload;
 
 #[derive(Debug, Parser)]
 #[clap(version)]
@@ -18,7 +18,7 @@ struct Opt {
     completions: Option<Shell>,
 
     #[clap(flatten)]
-    graph: flamegraph::Options,
+    graph: rattletrap::Options,
 
     #[clap(long = "perfdata", conflicts_with = "pid")]
     perf_file: Option<PathBuf>,
@@ -52,5 +52,5 @@ fn main() -> anyhow::Result<()> {
             (true, true) => return Err(anyhow!("no workload given to generate a flamegraph for")),
         }
     };
-    flamegraph::generate_flamegraph_for_workload(workload, opt.graph)
+    rattletrap::generate_flamegraph_for_workload(workload, opt.graph)
 }

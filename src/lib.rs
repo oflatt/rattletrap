@@ -494,54 +494,100 @@ pub fn generate_flamegraph_for_workload(workload: Workload, opts: Options) -> an
 
     let sudo = opts.root.as_ref().map(|inner| inner.as_deref());
 
-    let perf_output = if let Workload::ReadPerf(perf_file) = workload {
-        Some(perf_file)
-    } else {
-        arch::initial_command(
-            workload,
-            sudo,
-            opts.frequency(),
-            opts.custom_cmd,
-            opts.verbose,
-            opts.ignore_status,
-        )?
-    };
-
     #[cfg(unix)]
     signal_hook::low_level::unregister(handler);
 
-    let output = arch::output(perf_output, opts.script_no_inline, sudo)?;
+    // Compute collapsed stacks via streaming (Linux/macOS). Batch is allowed only for ReadPerf.
+    let mut collapsed: Vec<u8> = Vec::new();
+    let must_stream = !matches!(workload, Workload::ReadPerf(_));
 
-    let mut demangled_output = vec![];
-
-    demangle_stream(&mut Cursor::new(output), &mut demangled_output, false)
-        .context("unable to demangle")?;
-
-    let perf_reader = BufReader::new(&*demangled_output);
-
-    let mut collapsed = vec![];
-
-    let collapsed_writer = BufWriter::new(&mut collapsed);
+    // Real-time mode doesn't support custom perf/dtrace commands.
+    if must_stream && opts.custom_cmd.is_some() {
+        panic!("real-time streaming requires default tooling; custom --cmd is not supported");
+    }
 
     #[cfg(target_os = "linux")]
-    let mut folder = {
-        let mut collapse_options = CollapseOptions::default();
-        collapse_options.skip_after = opts.flamegraph_options.skip_after.clone();
-        Folder::from(collapse_options)
-    };
+    {
+        if !matches!(workload, Workload::ReadPerf(_)) && opts.custom_cmd.is_none() {
+            match linux_stream_and_collapse(
+                &workload,
+                sudo,
+                opts.frequency(),
+                opts.script_no_inline,
+                opts.verbose,
+                opts.ignore_status,
+                opts.flamegraph_options.skip_after.clone(),
+            ) {
+                Ok(bytes) => {
+                    collapsed = bytes;
+                }
+                Err(e) => panic!("real-time streaming (linux/perf) failed: {}", e),
+            }
+        }
+    }
 
     #[cfg(target_os = "macos")]
-    let mut folder = Folder::default();
+    {
+        if collapsed.is_empty() && must_stream && opts.custom_cmd.is_none() {
+            match macos_stream_and_collapse(
+                &workload,
+                sudo,
+                opts.frequency(),
+                opts.verbose,
+                opts.ignore_status,
+            ) {
+                Ok(bytes) => {
+                    collapsed = bytes;
+                }
+                Err(e) => panic!("real-time streaming (macOS/dtrace) failed: {}", e),
+            }
+        }
+    }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let mut folder = {
-        let collapse_options = CollapseOptions::default();
-        Folder::from(collapse_options)
-    };
+    if collapsed.is_empty() {
+        // Only allowed for ReadPerf workloads
+        if must_stream {
+            panic!("real-time streaming is required but not available on this platform");
+        }
+        let perf_output = if let Workload::ReadPerf(perf_file) = &workload {
+            Some(perf_file.clone())
+        } else {
+            unreachable!("batch path should only be hit for ReadPerf workloads")
+        };
 
-    folder
-        .collapse(perf_reader, collapsed_writer)
-        .context("unable to collapse generated profile data")?;
+        let output = arch::output(perf_output, opts.script_no_inline, sudo)?;
+
+        let mut demangled_output = vec![];
+        demangle_stream(&mut Cursor::new(output), &mut demangled_output, false)
+            .context("unable to demangle")?;
+
+        let perf_reader = BufReader::new(&*demangled_output);
+
+        let mut collapsed_buf = vec![];
+        let collapsed_writer = BufWriter::new(&mut collapsed_buf);
+
+        #[cfg(target_os = "linux")]
+        let mut folder = {
+            let mut collapse_options = CollapseOptions::default();
+            collapse_options.skip_after = opts.flamegraph_options.skip_after.clone();
+            Folder::from(collapse_options)
+        };
+
+        #[cfg(target_os = "macos")]
+        let mut folder = Folder::default();
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let mut folder = {
+            let collapse_options = CollapseOptions::default();
+            Folder::from(collapse_options)
+        };
+
+        folder
+            .collapse(perf_reader, collapsed_writer)
+            .context("unable to collapse generated profile data")?;
+
+        collapsed = collapsed_buf;
+    }
 
     if let Some(command) = opts.post_process {
         let command_vec = shlex::split(&command)
@@ -589,6 +635,10 @@ pub fn generate_flamegraph_for_workload(workload: Workload, opts: Options) -> an
         collapsed = thread_handle.join().unwrap()?;
     }
 
+    // Always-on, minimal sonification hook: parse collapsed stacks and invoke a no-op callback.
+    // This is intentionally lightweight and side-effect-free for now; we'll wire real sound later.
+    sonify_collapsed_stacks(&collapsed);
+
     let collapsed_reader = BufReader::new(&*collapsed);
 
     let flamegraph_filename = opts.output;
@@ -610,6 +660,423 @@ pub fn generate_flamegraph_for_workload(workload: Workload, opts: Options) -> an
     }
 
     Ok(())
+}
+
+/// Demangle collapsed folded lines by demangling each symbol between ';'.
+fn demangle_folded(input: &[u8]) -> Vec<u8> {
+    use rustc_demangle::try_demangle;
+    let mut out = Vec::with_capacity(input.len());
+    for line in input.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            out.push(b'\n');
+            continue;
+        }
+        let s = String::from_utf8_lossy(line);
+        if let Some((stack, count)) = s.rsplit_once(' ') {
+            let demangled_stack = stack
+                .split(';')
+                .map(|sym| {
+                    try_demangle(sym)
+                        .map(|d| d.to_string())
+                        .unwrap_or_else(|_| sym.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            out.extend_from_slice(demangled_stack.as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(count.as_bytes());
+            out.push(b'\n');
+        } else {
+            out.extend_from_slice(line);
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
+/// A writer that tees collapsed output into a sink and triggers sonification per line.
+struct CollapsedTeeWriter<'a> {
+    sink: &'a mut Vec<u8>,
+    buf: Vec<u8>,
+}
+
+impl<'a> CollapsedTeeWriter<'a> {
+    fn new(sink: &'a mut Vec<u8>) -> Self {
+        Self {
+            sink,
+            buf: Vec::with_capacity(4096),
+        }
+    }
+
+    fn handle_complete_line(&mut self, line: &[u8]) {
+        // Push the line (with newline) to sink
+        self.sink.extend_from_slice(line);
+        // Call sonifier on this one line
+        if let Ok(s) = std::str::from_utf8(line) {
+            let s = s.trim_end_matches(['\n', '\r']);
+            if !s.is_empty() {
+                if let Some((stack, count_str)) = s.rsplit_once(' ') {
+                    let count: u64 = count_str.parse().unwrap_or(1);
+                    let leaf = match stack.rsplit_once(';') {
+                        Some((_, leaf)) => leaf,
+                        None => stack,
+                    };
+                    on_function_activity(leaf, count);
+                }
+            }
+        } else {
+            // Fallback lossy parse
+            let s = String::from_utf8_lossy(line);
+            let s = s.trim_end_matches(['\n', '\r']);
+            if !s.is_empty() {
+                if let Some((stack, count_str)) = s.rsplit_once(' ') {
+                    let count: u64 = count_str.parse().unwrap_or(1);
+                    let leaf = match stack.rsplit_once(';') {
+                        Some((_, leaf)) => leaf,
+                        None => stack,
+                    };
+                    on_function_activity(leaf, count);
+                }
+            }
+        }
+    }
+}
+
+impl<'a> Write for CollapsedTeeWriter<'a> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Write-through to sink
+        self.sink.extend_from_slice(buf);
+        // Also scan for line breaks in local buffer for parsing
+        self.buf.extend_from_slice(buf);
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            // Split at newline inclusive
+            let line = self.buf.drain(..=pos).collect::<Vec<u8>>();
+            self.handle_complete_line(&line);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            // Treat remaining bytes as a final line
+            let line = std::mem::take(&mut self.buf);
+            self.handle_complete_line(&line);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_stream_and_collapse(
+    workload: &Workload,
+    sudo: Option<Option<&str>>,
+    freq: u32,
+    script_no_inline: bool,
+    verbose: bool,
+    ignore_status: bool,
+    skip_after: Vec<String>,
+) -> anyhow::Result<Vec<u8>> {
+    // Do not support custom perf command in streaming path.
+    let perf = env::var("PERF").unwrap_or_else(|_| "perf".to_string());
+
+    // Build `perf record ... -o -` command
+    let mut record_cmd = sudo_command(&perf, sudo);
+    record_cmd.arg("record");
+    record_cmd.arg("-F").arg(freq.to_string());
+    record_cmd.arg("--call-graph").arg("dwarf,64000");
+    record_cmd.arg("-g");
+    record_cmd.arg("-o").arg("-");
+
+    match workload {
+        Workload::Command(args) => {
+            record_cmd.args(args);
+        }
+        Workload::Pid(pids) => {
+            if let Some((first, rest)) = pids.split_first() {
+                let mut arg = first.to_string();
+                for pid in rest {
+                    arg.push(',');
+                    arg.push_str(&pid.to_string());
+                }
+                record_cmd.arg("-p").arg(arg);
+            }
+        }
+        Workload::ReadPerf(_) => unreachable!("streaming not used for ReadPerf"),
+    }
+
+    if verbose {
+        println!("command {:?}", record_cmd);
+    }
+    let mut record_child = record_cmd
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect(arch::SPAWN_ERROR);
+
+    // Build `perf script --force [--no-inline] -i -` command
+    let mut script_cmd = sudo_command(&perf, sudo);
+    script_cmd.arg("script");
+    script_cmd.arg("--force");
+    if script_no_inline {
+        script_cmd.arg("--no-inline");
+    }
+    script_cmd.arg("-i").arg("-");
+    script_cmd.stdin(
+        record_child
+            .stdout
+            .take()
+            .expect("failed to capture perf record stdout"),
+    );
+    script_cmd.stdout(Stdio::piped());
+
+    if verbose {
+        println!("command {:?}", script_cmd);
+    }
+    let mut script_child = script_cmd.spawn().expect(arch::SPAWN_ERROR);
+    let script_stdout = script_child
+        .stdout
+        .take()
+        .expect("failed to capture perf script stdout");
+
+    // Collapse streaming output, teeing each folded line to a buffer and our sonifier.
+    let mut collapsed_sink = Vec::<u8>::new();
+    let mut tee_writer = CollapsedTeeWriter::new(&mut collapsed_sink);
+
+    let mut collapse_options = CollapseOptions::default();
+    collapse_options.skip_after = skip_after;
+    let mut folder = Folder::from(collapse_options);
+
+    let collapse_res = folder.collapse(BufReader::new(script_stdout), &mut tee_writer);
+    if let Err(err) = collapse_res {
+        // Ensure children are terminated and reaped on error to avoid zombies
+        let _ = script_child.kill();
+        let _ = record_child.kill();
+        let _ = script_child.wait();
+        let _ = record_child.wait();
+        return Err(err).context("unable to collapse generated profile data (streaming)");
+    }
+
+    // Ensure processes are reaped
+    let status_script = script_child.wait().expect(arch::WAIT_ERROR);
+    let status_record = record_child.wait().expect(arch::WAIT_ERROR);
+    if !ignore_status && terminated_by_error(status_script) {
+        bail!("perf script exited with error: {:?}", status_script);
+    }
+    if !ignore_status && terminated_by_error(status_record) {
+        bail!("perf record exited with error: {:?}", status_record);
+    }
+
+    // Finalize any trailing buffered line
+    tee_writer.flush().ok();
+
+    // Demangle the folded lines token-wise to match batch output expectations.
+    let demangled = demangle_folded(&collapsed_sink);
+    Ok(demangled)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_stream_and_collapse(
+    workload: &Workload,
+    sudo: Option<Option<&str>>,
+    freq: u32,
+    verbose: bool,
+    ignore_status: bool,
+) -> anyhow::Result<Vec<u8>> {
+    use inferno::collapse::dtrace::{Folder as DtraceFolder, Options as DtraceCollapseOptions};
+
+    // Build base dtrace command with arch wrapper to avoid Rosetta traps
+    let mut cmd = macos_base_dtrace_command(sudo);
+
+    // Configure user stack frames and quiet output
+    cmd.arg("-x").arg("ustackframes=100");
+    cmd.arg("-q");
+
+    // Aggregation and periodic print
+    let profile_clause = format!(
+        "profile-{} /pid == $target/ {{ @[ustack(100)] = count(); }}",
+        freq
+    );
+    cmd.arg("-n").arg(profile_clause);
+    // Add a sentinel after each 100ms aggregate to delimit windows for incremental collapse.
+    cmd.arg("-n")
+        .arg("tick-100ms { printa(@); printf(\"__RT_END__\\n\"); trunc(@); }");
+
+    match workload {
+        Workload::Command(args) => {
+            // Escape command into a single string for -c
+            let mut escaped = String::new();
+            for (i, arg) in args.iter().enumerate() {
+                if i > 0 {
+                    escaped.push(' ');
+                }
+                escaped.push_str(&arg.replace(' ', "\\ "));
+            }
+            cmd.arg("-c").arg(escaped);
+        }
+        Workload::Pid(pids) => {
+            for pid in pids {
+                cmd.arg("-p").arg(pid.to_string());
+            }
+        }
+        Workload::ReadPerf(_) => unreachable!("streaming not used for ReadPerf"),
+    }
+
+    if verbose {
+        println!("command {:?}", cmd);
+    }
+
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect(arch::SPAWN_ERROR);
+    let mut stdout = child
+        .stdout
+        .take()
+        .expect("failed to capture dtrace stdout");
+    let mut dtrace_stderr = child
+        .stderr
+        .take()
+        .expect("failed to capture dtrace stderr");
+    let stderr_handle = std::thread::spawn(move || -> String {
+        let mut buf = String::new();
+        let _ = std::io::Read::read_to_string(&mut dtrace_stderr, &mut buf);
+        buf
+    });
+
+    // Stream-collapse DTrace output in windows delimited by the sentinel string.
+    let sentinel: &[u8] = b"__RT_END__\n";
+    let mut collapsed_sink = Vec::<u8>::new();
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut tmp = [0u8; 8192];
+
+    loop {
+        match std::io::Read::read(&mut stdout, &mut tmp) {
+            Ok(0) => break, // EOF
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr_text = stderr_handle.join().unwrap_or_default();
+                return Err(anyhow!(
+                    "error reading dtrace stdout: {}\n{}",
+                    e,
+                    stderr_text
+                ));
+            }
+        }
+
+        // Process all complete windows in the buffer
+        loop {
+            // Find sentinel position
+            let mut found = None;
+            if buf.len() >= sentinel.len() {
+                for i in 0..=buf.len() - sentinel.len() {
+                    if &buf[i..i + sentinel.len()] == sentinel {
+                        found = Some(i);
+                        break;
+                    }
+                }
+            }
+            let Some(pos) = found else { break };
+
+            // Take the window up to the sentinel (exclusive)
+            let window: Vec<u8> = buf.drain(..pos).collect();
+            // Remove the sentinel itself
+            let _ = buf.drain(..sentinel.len());
+
+            if window.is_empty() {
+                continue;
+            }
+
+            // Collapse this window using inferno's DTrace folder
+            let d_opts = DtraceCollapseOptions::default();
+            let mut folder = DtraceFolder::from(d_opts);
+            let mut folded = Vec::<u8>::new();
+            if let Err(err) = folder.collapse(BufReader::new(Cursor::new(window)), &mut folded) {
+                eprintln!("warning: collapse error for dtrace window: {}", err);
+                continue;
+            }
+
+            // Demangle folded lines and emit events immediately
+            let demangled = demangle_folded(&folded);
+            sonify_collapsed_stacks(&demangled);
+            // Accumulate for final SVG
+            collapsed_sink.extend_from_slice(&demangled);
+        }
+    }
+
+    let status = child.wait().expect(arch::WAIT_ERROR);
+    let stderr_text = stderr_handle.join().unwrap_or_default();
+    if !ignore_status && terminated_by_error(status) {
+        if stderr_text.trim().is_empty() {
+            bail!("dtrace exited with error: {:?}", status);
+        } else {
+            bail!("dtrace exited with error: {:?}: {}", status, stderr_text);
+        }
+    }
+
+    Ok(collapsed_sink)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_base_dtrace_command(sudo: Option<Option<&str>>) -> Command {
+    // Run dtrace in native arch to avoid Rosetta issues
+    let mut command = sudo_command("arch", sudo);
+    #[cfg(target_pointer_width = "64")]
+    command.arg("-64");
+    #[cfg(target_pointer_width = "32")]
+    command.arg("-32");
+    command.arg(env::var("DTRACE").unwrap_or_else(|_| "dtrace".to_string()));
+    command
+}
+/// Parse the collapsed stacks (folded format) and emit per-function activity events.
+/// Always enabled; currently a no-op sink so we can evolve behavior later without changing call sites.
+fn sonify_collapsed_stacks(collapsed: &[u8]) {
+    use std::borrow::Cow;
+
+    let text: Cow<str> = match std::str::from_utf8(collapsed) {
+        Ok(s) => Cow::from(s),
+        Err(_) => String::from_utf8_lossy(collapsed),
+    };
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Folded format: f1;f2;...;fN COUNT
+        let (stack, count_str) = match line.rsplit_once(' ') {
+            Some(parts) => parts,
+            None => continue,
+        };
+
+        let count: u64 = count_str.parse().unwrap_or(1);
+
+        let leaf = match stack.rsplit_once(';') {
+            Some((_, leaf)) => leaf,
+            None => stack,
+        };
+
+        on_function_activity(leaf, count);
+    }
+}
+
+/// Stub for future sound generation. Currently does nothing.
+/// `function` is the leaf frame symbol, `count` is the sample count for that leaf in this line.
+fn on_function_activity(function: &str, _count: u64) {
+    // Hook for future sound generation.
+    // Intentionally no stdout printing by default to keep real-time output quiet.
+    // Enable debug printing by setting env var RATTLETRAP_SONIFY_DEBUG=1.
+    static SONIFY_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *SONIFY_DEBUG.get_or_init(|| match std::env::var("RATTLETRAP_SONIFY_DEBUG") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    });
+    if enabled {
+        println!("{}", function);
+    }
 }
 
 #[derive(Debug, Args)]
