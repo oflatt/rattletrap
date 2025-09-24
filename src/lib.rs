@@ -886,8 +886,11 @@ fn macos_stream_and_collapse(
     // Build base dtrace command with arch wrapper to avoid Rosetta traps
     let mut cmd = macos_base_dtrace_command(sudo);
 
-    // Configure user stack frames and quiet output
+    // Configure user stack frames and quiet output, and increase delivery rates so data
+    // is flushed to userland frequently (avoid ~1s bursts).
     cmd.arg("-x").arg("ustackframes=100");
+    cmd.arg("-x").arg("switchrate=100hz");
+    cmd.arg("-x").arg("aggrate=100hz");
     cmd.arg("-q");
 
     // Aggregation and periodic print
