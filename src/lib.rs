@@ -493,7 +493,12 @@ pub fn generate_flamegraph_for_workload(workload: Workload, opts: Options) -> an
         signal_hook::low_level::register(SIGINT, || {}).expect("cannot register signal handler")
     };
 
-    let sudo = opts.root.as_ref().map(|inner| inner.as_deref());
+    // Determine sudo behavior. On macOS we always run with sudo to ensure tracing works,
+    // even if the user did not pass --root. If the user provided flags, pass them through.
+    #[cfg(target_os = "macos")]
+    let sudo: Option<Option<&str>> = Some(opts.root.as_ref().and_then(|inner| inner.as_deref()));
+    #[cfg(not(target_os = "macos"))]
+    let sudo = opts.root.as_deref();
 
     #[cfg(unix)]
     signal_hook::low_level::unregister(handler);

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 use cargo_metadata::{Artifact, ArtifactDebuginfo, Message, MetadataCommand, Package, TargetKind};
-use clap::{Args, Parser};
+use clap::Parser;
 
 use rattletrap::Workload;
 
@@ -13,7 +13,8 @@ enum UnitTestTargetKind {
     Lib,
 }
 
-#[derive(Args, Debug)]
+#[derive(Parser, Debug)]
+#[command(trailing_var_arg = true, bin_name = "cargo-rattletrap")]
 struct Opt {
     /// Build with the dev profile
     #[clap(long)]
@@ -88,13 +89,7 @@ struct Opt {
     trailing_arguments: Vec<String>,
 }
 
-#[derive(Parser, Debug)]
-#[clap(bin_name = "cargo")]
-enum Cli {
-    /// A cargo subcommand for generating flamegraphs, using inferno
-    #[clap(version)]
-    Flamegraph(Opt),
-}
+// Note: previously this was a cargo subcommand `cargo flamegraph`. Now we parse directly.
 
 fn build(opt: &Opt, kind: Vec<TargetKind>) -> anyhow::Result<Vec<Artifact>> {
     use std::process::{Command, Output, Stdio};
@@ -427,7 +422,7 @@ fn find_unique_target(
 }
 
 fn main() -> anyhow::Result<()> {
-    let Cli::Flamegraph(mut opt) = Cli::parse();
+    let mut opt = Opt::parse();
     opt.graph.check()?;
 
     let kind = if opt.bin.is_none()
